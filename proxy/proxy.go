@@ -3,19 +3,21 @@ package proxy
 import (
 	"bytes"
 	"crypto/tls"
-	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/cnsilvan/UnblockNeteaseMusic/common"
 	"github.com/cnsilvan/UnblockNeteaseMusic/config"
 	"github.com/cnsilvan/UnblockNeteaseMusic/network"
 	"github.com/cnsilvan/UnblockNeteaseMusic/processor"
 	"github.com/cnsilvan/UnblockNeteaseMusic/version"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
-	"strconv"
-	"strings"
-	"time"
 )
 
 type HttpHandler struct{}
@@ -23,7 +25,7 @@ type HttpHandler struct{}
 var localhost = map[string]int{}
 
 func InitProxy() {
-	fmt.Println("-------------------Init Proxy-------------------")
+	log.Println("-------------------Init Proxy-------------------")
 	address := "0.0.0.0:"
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -43,19 +45,25 @@ func InitProxy() {
 	for k, _ := range localhost {
 		localhostKey = append(localhostKey, k)
 	}
-	fmt.Println("Http Proxy:")
-	fmt.Println(strings.Join(localhostKey, " , "))
+	log.Println("Http Proxy:")
+	log.Println(strings.Join(localhostKey, " , "))
 	go startTlsServer(address+strconv.Itoa(*config.TLSPort), *config.CertFile, *config.KeyFile, &HttpHandler{})
 	go startServer(address+strconv.Itoa(*config.Port), &HttpHandler{})
 }
 func (h *HttpHandler) ServeHTTP(resp http.ResponseWriter, request *http.Request) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Recover panic : ", r)
+		}
+	}()
+	//printMemStats()
 	requestURI := request.RequestURI
-	if strings.Contains(requestURI, "/unblockmusic/") {
-		realMusicUrl := strings.ReplaceAll(requestURI, "/unblockmusic/", "")
-		//fmt.Printf("Download:%s(%s)\n", realMusicUrl, request.Method)
+	if i := strings.Index(requestURI, "/unblockmusic/"); len(requestURI) > 0 && i != -1 {
+		realMusicUrl := requestURI[i+len("/unblockmusic/"):]
+		//log.Printf("Download:%s(%s)\n", realMusicUrl, request.Method)
 		realURI, err := url.Parse(realMusicUrl)
 		if err != nil {
-			fmt.Println("url.Parse error:", err)
+			log.Println("url.Parse error:", err)
 			return
 		}
 		response, err := network.Request(&network.ClientRequest{
@@ -64,21 +72,27 @@ func (h *HttpHandler) ServeHTTP(resp http.ResponseWriter, request *http.Request)
 			Host:                 realURI.Host,
 			Header:               request.Header,
 			Body:                 request.Body,
+			Cookies:              request.Cookies(),
 			ForbiddenEncodeQuery: true,
-			Proxy:                true,
+			Proxy:                false,
 		})
 		if err != nil {
-			fmt.Println("network.Request error:", err)
+			log.Println("network.Request error:", err)
 			return
 		}
 		defer response.Body.Close()
 		for name, values := range response.Header {
 			resp.Header()[name] = values
 		}
+		//fix ios 7.0.20
+		resp.Header().Del("Keep-Alive")
+		if response.StatusCode == 200 && (len(request.Header.Get("range")) > 0 || len(response.Header.Get("content-range")) > 0) {
+			response.StatusCode = 206
+		}
 		resp.WriteHeader(response.StatusCode)
 		_, err = io.Copy(resp, response.Body)
 		if err != nil {
-			//fmt.Println("io.Copy error:", err)
+			//log.Println("io.Copy error:", err)
 			return
 		}
 	} else {
@@ -89,7 +103,7 @@ func (h *HttpHandler) ServeHTTP(resp http.ResponseWriter, request *http.Request)
 		left := uriBytes[:(len(uriBytes) / 2)]
 		right := uriBytes[len(uriBytes)/2:]
 		hostStr := request.URL.Host
-		//fmt.Println(request.URL.String(), ",", request.Method)
+		//log.Println(request.URL.String(), ",", request.Method)
 		if len(hostStr) == 0 {
 			hostStr = request.Host
 		}
@@ -118,7 +132,7 @@ func (h *HttpHandler) ServeHTTP(resp http.ResponseWriter, request *http.Request)
 			} else {
 				requestURI += string(uriBytes)
 			}
-			fmt.Printf("Abandon:%s\n", requestURI)
+			log.Printf("Abandon:%s\n", requestURI)
 			resp.WriteHeader(200)
 			resp.Write([]byte(version.AppVersion()))
 			return
@@ -142,24 +156,24 @@ func (h *HttpHandler) ServeHTTP(resp http.ResponseWriter, request *http.Request)
 				if len(rawQuery) > 0 {
 					urlString = urlString + "?" + rawQuery
 				}
-				fmt.Printf("Transport:%s(%s)(%s)\n", urlString, request.Host, request.Method)
+				log.Printf("Transport:%s(%s)(%s)\n", urlString, request.Host, request.Method)
 				netease := processor.RequestBefore(request)
-				//fmt.Printf("{path:%s,web:%v,encrypted:%v}\n", netease.Path, netease.Web, netease.Encrypted)
+				//log.Printf("{path:%s,web:%v,encrypted:%v}\n", netease.Path, netease.Web, netease.Encrypted)
 				response, err := processor.Request(request, urlString)
 				if err != nil {
-					fmt.Println("Request error:", urlString)
+					log.Println("Request error:", urlString)
 					return
 				}
 				defer response.Body.Close()
 				processor.RequestAfter(request, response, netease)
 				for name, values := range response.Header {
 					resp.Header()[name] = values
-					//fmt.Println(name,"=",values)
+					//log.Println(name,"=",values)
 				}
 				resp.WriteHeader(response.StatusCode)
 				_, err = io.Copy(resp, response.Body)
 				if err != nil {
-					fmt.Println("io.Copy error:", err)
+					log.Println("io.Copy error:", err)
 					return
 				}
 				defer response.Body.Close()
@@ -192,30 +206,31 @@ func (h *HttpHandler) ServeHTTP(resp http.ResponseWriter, request *http.Request)
 					}
 				}
 				//for key, values := range request.Header {
-				//	fmt.Println(key, "=", values)
+				//	log.Println(key, "=", values)
 				//}
-				fmt.Printf("Direct:%s(%s)(%s)\n", requestURI, request.Host, request.Method)
+				log.Printf("Direct:%s(%s)(%s)\n", requestURI, request.Host, request.Method)
 				response, err := network.Request(&network.ClientRequest{
 					Method:    request.Method,
 					RemoteUrl: requestURI,
 					Host:      request.Host,
 					Header:    request.Header,
 					Body:      request.Body,
-					Proxy:     false,
+					Cookies:   request.Cookies(),
+					Proxy:     true,
 				})
 				if err != nil {
-					fmt.Println("network.Request error:", err)
+					log.Println("network.Request error:", err)
 					return
 				}
 				defer response.Body.Close()
 				for name, values := range response.Header {
 					resp.Header()[name] = values
-					//fmt.Println(name,"=",values)
+					//log.Println(name,"=",values)
 				}
 				resp.WriteHeader(response.StatusCode)
 				_, err = io.Copy(resp, response.Body)
 				if err != nil {
-					fmt.Println("io.Copy error:", err)
+					log.Println("io.Copy error:", err)
 					return
 				}
 
@@ -225,18 +240,18 @@ func (h *HttpHandler) ServeHTTP(resp http.ResponseWriter, request *http.Request)
 	}
 }
 func proxyConnectLocalhost(rw http.ResponseWriter, req *http.Request) {
-	fmt.Printf("Local Received request %s %s %s\n",
+	log.Printf("Local Received request %s %s %s\n",
 		req.Method,
 		req.Host,
 		req.RemoteAddr,
 	)
 	hij, ok := rw.(http.Hijacker)
 	if !ok {
-		fmt.Println("HTTP Server does not support hijacking")
+		log.Println("HTTP Server does not support hijacking")
 	}
 	client, _, err := hij.Hijack()
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return
 	}
 	localUrl := "localhost:"
@@ -250,7 +265,7 @@ func proxyConnectLocalhost(rw http.ResponseWriter, req *http.Request) {
 		server, err = tls.Dial("tcp", localUrl, &tls.Config{InsecureSkipVerify: true})
 	}
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return
 	}
 	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
@@ -260,7 +275,7 @@ func proxyConnectLocalhost(rw http.ResponseWriter, req *http.Request) {
 	defer server.Close()
 }
 func proxyConnect(rw http.ResponseWriter, req *http.Request) {
-	fmt.Printf("Received request %s %s %s\n",
+	log.Printf("Received request %s %s %s\n",
 		req.Method,
 		req.Host,
 		req.RemoteAddr,
@@ -273,16 +288,16 @@ func proxyConnect(rw http.ResponseWriter, req *http.Request) {
 	host := req.URL.Host
 	hij, ok := rw.(http.Hijacker)
 	if !ok {
-		fmt.Println("HTTP Server does not support hijacking")
+		log.Println("HTTP Server does not support hijacking")
 	}
 	client, _, err := hij.Hijack()
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return
 	}
 	server, err := net.DialTimeout("tcp", host, 15*time.Second)
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return
 	}
 	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
@@ -292,7 +307,7 @@ func proxyConnect(rw http.ResponseWriter, req *http.Request) {
 	defer server.Close()
 }
 func startTlsServer(addr, certFile, keyFile string, handler http.Handler) {
-	fmt.Printf("starting TLS Server  %s\n", addr)
+	log.Printf("starting TLS Server  %s\n", addr)
 	s := &http.Server{
 		Addr:           addr,
 		Handler:        handler,
@@ -306,7 +321,7 @@ func startTlsServer(addr, certFile, keyFile string, handler http.Handler) {
 	}
 }
 func startServer(addr string, handler http.Handler) {
-	fmt.Printf("starting Server  %s\n", addr)
+	log.Printf("starting Server  %s\n", addr)
 	s := &http.Server{
 		Addr:           addr,
 		Handler:        handler,
@@ -319,4 +334,10 @@ func startServer(addr string, handler http.Handler) {
 		panic(err)
 	}
 
+}
+func printMemStats() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	log.Printf("Alloc = %v TotalAlloc = %v Sys = %v NumGC = %v HeapInuse= %v \n", m.Alloc/1024, m.TotalAlloc/1024, m.Sys/1024, m.NumGC, m.HeapInuse/1024)
 }
